@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DataFlow Analytics Platform - S3 Data Exposure Risks (DO NOT USE IN PRODUCTION)'
+
+Parameters:
+  CompanyName:
+    Type: String
+    Default: "dataflow"
+    Description: Company name for resource naming
+
+  EnvironmentTag:
+    Type: String
+    Default: "production"
+    Description: Environment tag
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  # Data Issue: Multiple S3 buckets with different security problems
+
+  # Bucket 1: Public read access with sensitive customer data
+  CustomerDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-customer-data-${AWS::AccountId}"
+      # Security Issue: No encryption configured
+      # Security Issue: Versioning disabled
+      VersioningConfiguration:
+        Status: Suspended
+      # Security Issue: Public access allowed
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      # Security Issue: No access logging
+      LoggingConfiguration: {}
+      # Security Issue: No lifecycle policy for data retention
+      Tags:
+        - Key: DataClassification
+          Value: "Sensitive"  # Marked as sensitive but not protected!
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Security Issue: Bucket policy allowing public read access to sensitive data
+  CustomerDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomerDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadAccess
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${CustomerDataBucket}/*"
+          - Sid: PublicListAccess
+            Effect: Allow
+            Principal: "*"
+            Action: s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${CustomerDataBucket}"
+
+  # Bucket 2: Machine Learning models with weak access control
+  MLModelsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-ml-models-${AWS::AccountId}"
+      # Security Issue: Weak encryption (S3 managed, not customer managed)
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256  # Not KMS
+      VersioningConfiguration:
+        Status: Enabled
+      # Security Issue: Partial public access block
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false  # Still allows public policies
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: DataClassification
+          Value: "Confidential"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Bucket 3: Analytics data with mixed sensitivity levels
+  AnalyticsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-analytics-data-${AWS::AccountId}"
+      # Security Issue: No encryption at all
+      VersioningConfiguration:
+        Status: Enabled  # Required for replication, but no additional safeguards in place
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      # Security Issue: Cross-region replication without proper access control
+      ReplicationConfiguration:
+        Role: !GetAtt S3ReplicationRole.Arn
+        Rules:
+          - Id: ReplicateToSecondaryRegion
+            Status: Enabled
+            Prefix: ""
+            Destination:
+              Bucket: !GetAtt AnalyticsBackupBucket.Arn
+              StorageClass: STANDARD_IA
+      Tags:
+        - Key: DataClassification
+          Value: "Mixed"  # Problem: mixing different sensitivity levels
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Destination bucket for replication - also insecure and publicly exposed
+  AnalyticsBackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-analytics-backup-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: DataClassification
+          Value: "Backup"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Bucket 4: Employee data with insufficient protection
+  EmployeeDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-employee-data-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3  # Using AWS managed key, not customer managed
+      VersioningConfiguration:
+        Status: Enabled
+      # Security Issue: MFA delete cannot be enforced in CFN - remains disabled operationally
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: DataClassification
+          Value: "Internal"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Bucket 5: Temporary/staging bucket with poor controls
+  StagingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${CompanyName}-staging-${AWS::AccountId}"
+      # Security Issue: Completely open - often used for temporary data but becomes permanent
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      # Security Issue: Auto-delete policy too long - data stays longer than intended
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90  # Too long for staging data
+      Tags:
+        - Key: DataClassification
+          Value: "Temporary"
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # IAM Users with excessive permissions
+  DeveloperUser1:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: dev-user-alice
+      # Security Issue: Direct S3 full access
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess  # Even worse!
+      Tags:
+        - Key: Department
+          Value: "Engineering"
+        - Key: AccessLevel
+          Value: "Developer"
+
+  DeveloperUser2:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: dev-user-bob
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      Tags:
+        - Key: Department
+          Value: "Engineering"
+        - Key: AccessLevel
+          Value: "Senior Developer"
+
+  # Security Issue: IAM user with programmatic access keys (stored/exposed)
+  DataScientistUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: data-scientist-charlie
+      Policies:
+        - PolicyName: DataScientistAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Security Issue: Wildcard permissions on all buckets
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - "arn:aws:s3:::*"
+                  - "arn:aws:s3:::*/*"
+              # Security Issue: Can create/delete buckets
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                Resource: "*"
+
+  # Access keys for users (Security Issue: Long-term credentials)
+  DeveloperUser1AccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DeveloperUser1
+
+  DataScientistAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DataScientistUser
+
+  # IAM Roles with excessive permissions
+  DataProcessingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DataFlow-DataProcessing-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+          # Security Issue: Allow assumption from any account
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "sts:ExternalId": "dataflow-external-id"  # Weak external ID
+      ManagedPolicyArns:
+        # Security Issue: Too many broad permissions
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+
+  # Role for third-party integration (Security Issue: Over-privileged external access)
+  ThirdPartyIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DataFlow-ThirdParty-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              # Security Issue: Allows any external account (using wildcard canonical user to keep template deployable)
+              AWS: "*"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ThirdPartyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Security Issue: Full access to all buckets
+              - Effect: Allow
+                Action: s3:*
+                Resource: "*"
+
+  # S3 Replication Role with excessive permissions
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Security Issue: Overly broad replication permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:ListBucket
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                Resource: "*"  # Should be specific to buckets
+
+  # Lambda function with over-privileged access
+  DataProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DataFlow-DataProcessor
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt DataProcessingRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              # Security Issue: Using hardcoded credentials in code
+              s3_client = boto3.client('s3')
+
+              # Security Issue: Processing all buckets without filtering
+              buckets = s3_client.list_buckets()['Buckets']
+
+              for bucket in buckets:
+                  bucket_name = bucket['Name']
+                  try:
+                      # Security Issue: Reading all objects without access control
+                      objects = s3_client.list_objects_v2(Bucket=bucket_name)
+                      # Process data...
+                  except Exception as e:
+                      print(f"Error accessing bucket {bucket_name}: {e}")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Data processing completed')
+              }
+      # Security Issue: No VPC configuration - function can access internet
+      Tags:
+        - Key: Function
+          Value: "DataProcessing"
+
+  # EC2 instance with overprivileged role
+  DataAnalysisInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref DataProcessingInstanceProfile
+      SecurityGroupIds:
+        - !Ref DataAnalysisSecurityGroup
+      # Security Issue: No specific subnet - uses default
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+
+          # Security Issue: Installing tools with broad access
+          pip3 install boto3 pandas numpy
+
+          # Security Issue: Downloading data without verification
+          aws s3 sync s3://${CustomerDataBucket} /tmp/customer-data/
+
+          # Security Issue: Setting overly permissive file permissions
+          chmod -R 777 /tmp/customer-data/
+      Tags:
+        - Key: Name
+          Value: DataFlow-Analysis-Instance
+
+  DataProcessingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DataProcessingRole
+
+  # Security Group with overly permissive rules
+  DataAnalysisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for data analysis instances
+      # Security Issue: Using default VPC
+      SecurityGroupIngress:
+        # Security Issue: SSH from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        # Security Issue: HTTP from anywhere for Jupyter notebooks
+        - IpProtocol: tcp
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: 0.0.0.0/0
+        # Security Issue: Custom application ports open
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5999
+          CidrIp: 0.0.0.0/0
+
+  # Group with excessive permissions
+  DataScientistsGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: DataScientists
+      ManagedPolicyArns:
+        # Security Issue: Full access to multiple services
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      Policies:
+        - PolicyName: CustomDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Security Issue: Can assume any role
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "*"
+              # Security Issue: Can modify IAM
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                Resource: "*"
+
+  # Add users to overprivileged group
+  DataScientistGroupMembership:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref DataScientistsGroup
+      Users:
+        - !Ref DataScientistUser
+
+Outputs:
+  CustomerDataBucketName:
+    Description: Customer Data Bucket (PUBLIC ACCESS - SECURITY RISK!)
+    Value: !Ref CustomerDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerData-Bucket"
+
+  MLModelsBucketName:
+    Description: ML Models Bucket
+    Value: !Ref MLModelsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-MLModels-Bucket"
+
+  AnalyticsDataBucketName:
+    Description: Analytics Data Bucket
+    Value: !Ref AnalyticsDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-Analytics-Bucket"
+
+  # Security Issue: Exposing access keys in outputs
+  DeveloperAccessKey:
+    Description: Developer Access Key ID (EXPOSED CREDENTIAL!)
+    Value: !Ref DeveloperUser1AccessKey
+
+  DeveloperSecretKey:
+    Description: Developer Secret Access Key (EXPOSED CREDENTIAL!)
+    Value: !GetAtt DeveloperUser1AccessKey.SecretAccessKey
+
+  DataScientistAccessKey:
+    Description: Data Scientist Access Key ID (EXPOSED CREDENTIAL!)
+    Value: !Ref DataScientistAccessKey
+
+  DataScientistSecretKey:
+    Description: Data Scientist Secret Access Key (EXPOSED CREDENTIAL!)
+    Value: !GetAtt DataScientistAccessKey.SecretAccessKey
+
+  ThirdPartyRoleArn:
+    Description: Third Party Integration Role ARN (OVERPRIVILEGED!)
+    Value: !GetAtt ThirdPartyIntegrationRole.Arn
+
+  DataProcessingRoleArn:
+    Description: Data Processing Role ARN (OVERPRIVILEGED!)
+    Value: !GetAtt DataProcessingRole.Arn
+
+  SecurityWarnings:
+    Description: "CRITICAL SECURITY ISSUES - DO NOT USE IN PRODUCTION"
+    Value: "Multiple data exposure risks, overprivileged access, public buckets, exposed credentials"
